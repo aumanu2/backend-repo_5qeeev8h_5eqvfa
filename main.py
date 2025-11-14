@@ -1,9 +1,8 @@
 import os
-from typing import List
-from fastapi import FastAPI, HTTPException
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from bson import ObjectId
 
 from database import create_document, get_documents, db
 from schemas import Profile, Post, Room
@@ -38,11 +37,19 @@ def read_root():
 
 
 # Profiles
+INVITE_CODE = os.getenv("INVITE_CODE")
+
 @app.post("/api/profiles", response_model=InsertResponse)
-def create_profile(profile: Profile):
+def create_profile(profile: Profile, x_invite_code: Optional[str] = Header(default=None)):
     try:
+        # Invite-only gating if INVITE_CODE is set in env
+        if INVITE_CODE:
+            if not x_invite_code or x_invite_code != INVITE_CODE:
+                raise HTTPException(status_code=401, detail="Invalid or missing invite code")
         inserted_id = create_document("profile", profile)
         return {"id": inserted_id}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -60,7 +67,6 @@ def list_profiles():
 @app.post("/api/posts", response_model=InsertResponse)
 def create_post(post: Post):
     try:
-        # Basic length check is already in schema
         inserted_id = create_document("post", post)
         return {"id": inserted_id}
     except Exception as e:
@@ -71,7 +77,6 @@ def create_post(post: Post):
 def list_posts():
     try:
         docs = get_documents("post", {}, limit=100)
-        # Sort newest first if timestamps available
         docs_sorted = sorted(docs, key=lambda d: d.get("created_at", 0), reverse=True)
         return [to_public(d) for d in docs_sorted]
     except Exception as e:
