@@ -7,6 +7,7 @@ Collection name is the lowercase of the class name.
 
 from pydantic import BaseModel, Field, HttpUrl, EmailStr
 from typing import Optional, List, Literal
+from datetime import datetime
 
 # Core profiles
 class Profile(BaseModel):
@@ -33,3 +34,17 @@ class Room(BaseModel):
     host_id: str
     is_live: bool = True
     cover_url: Optional[HttpUrl] = None
+
+# Auth one-time code request
+class AuthCode(BaseModel):
+    email: EmailStr
+    code: str
+    expires_at: datetime
+    used: bool = False
+
+# Chat message schema
+class Message(BaseModel):
+    room_id: str
+    sender_id: Optional[str] = None
+    sender_email: Optional[EmailStr] = None
+    content: str = Field(..., min_length=1, max_length=1000)

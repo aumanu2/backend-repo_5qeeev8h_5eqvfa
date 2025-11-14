@@ -1,11 +1,14 @@
 import os
-from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Header
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict
+
+from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 from database import create_document, get_documents, db
-from schemas import Profile, Post, Room
+from schemas import Profile, Post, Room, AuthCode, Message
 
 app = FastAPI(title="Youth Founder Network API")
 
@@ -28,6 +31,10 @@ def to_public(doc: dict) -> dict:
     d = doc.copy()
     if "_id" in d:
         d["id"] = str(d.pop("_id"))
+    # Convert datetimes to isoformat strings for JSON
+    for k, v in list(d.items()):
+        if hasattr(v, 'isoformat'):
+            d[k] = v.isoformat()
     return d
 
 
@@ -101,6 +108,238 @@ def list_rooms():
         return [to_public(d) for d in docs_sorted]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------
+# Passwordless Auth (Magic Code)
+# ---------------------------
+DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() in ("1", "true", "yes")
+
+class RequestCodeBody(BaseModel):
+    email: EmailStr
+
+class VerifyCodeBody(BaseModel):
+    email: EmailStr
+    code: str
+
+class VerifyResponse(BaseModel):
+    token: str
+    email: EmailStr
+    profile: Optional[dict] = None
+
+SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "1440"))  # default 1 day
+CODE_TTL_MINUTES = int(os.getenv("CODE_TTL_MINUTES", "10"))
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+@app.post("/api/auth/request-code")
+def request_code(payload: RequestCodeBody):
+    try:
+        # generate 6-digit code
+        code = f"{secrets.randbelow(1000000):06d}"
+        expires_at = _now() + timedelta(minutes=CODE_TTL_MINUTES)
+        auth_code = AuthCode(email=payload.email, code=code, expires_at=expires_at, used=False)
+        create_document("authcode", auth_code)
+        # In real app, send email via provider. In demo, optionally return code.
+        resp = {"status": "ok", "message": "Code sent"}
+        if DEMO_MODE:
+            resp["debug_code"] = code
+        return resp
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/auth/verify", response_model=VerifyResponse)
+def verify_code(payload: VerifyCodeBody):
+    try:
+        # find latest unexpired, unused code
+        codes = get_documents("authcode", {"email": payload.email}, limit=50)
+        codes_sorted = sorted(codes, key=lambda d: d.get("created_at", 0), reverse=True)
+        valid = None
+        for c in codes_sorted:
+            if c.get("used"):
+                continue
+            exp = c.get("expires_at")
+            if isinstance(exp, str):
+                try:
+                    exp = datetime.fromisoformat(exp)
+                except Exception:
+                    exp = _now() - timedelta(seconds=1)
+            if exp and exp < _now():
+                continue
+            if c.get("code") == payload.code:
+                valid = c
+                break
+        if not valid:
+            raise HTTPException(status_code=401, detail="Invalid or expired code")
+        # mark code as used (best-effort)
+        try:
+            if db:
+                db["authcode"].update_one({"_id": valid["_id"]}, {"$set": {"used": True, "updated_at": _now()}})
+        except Exception:
+            pass
+        # create session token
+        token = secrets.token_urlsafe(32)
+        session = {
+            "email": str(payload.email),
+            "token": token,
+            "created_at": _now(),
+            "expires_at": _now() + timedelta(minutes=SESSION_TTL_MINUTES),
+        }
+        if db:
+            db["session"].insert_one(session)
+        # attach profile if exists
+        profs = get_documents("profile", {"email": str(payload.email)}, limit=1)
+        profile = to_public(profs[0]) if profs else None
+        return VerifyResponse(token=token, email=payload.email, profile=profile)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _require_session(authorization: Optional[str]) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1]
+    # validate token from db
+    if db is None:
+        return token  # fallback in dev if db missing
+    sess = db["session"].find_one({"token": token})
+    if not sess:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    exp = sess.get("expires_at")
+    if isinstance(exp, str):
+        try:
+            exp = datetime.fromisoformat(exp)
+        except Exception:
+            exp = _now() - timedelta(seconds=1)
+    if exp and exp < _now():
+        raise HTTPException(status_code=401, detail="Session expired")
+    return str(sess.get("email"))
+
+
+@app.get("/api/me")
+def me(authorization: Optional[str] = Header(default=None)):
+    try:
+        email = _require_session(authorization)
+        profs = get_documents("profile", {"email": email}, limit=1)
+        return {"email": email, "profile": to_public(profs[0]) if profs else None}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------
+# Messages and Realtime (WebSocket)
+# ---------------------------
+
+@app.post("/api/rooms/{room_id}/messages", response_model=InsertResponse)
+def post_message(room_id: str, message: Message, authorization: Optional[str] = Header(default=None)):
+    try:
+        sender_email = _require_session(authorization)
+        data = message.model_dump()
+        data["room_id"] = room_id
+        data["sender_email"] = data.get("sender_email") or sender_email
+        inserted_id = create_document("message", data)
+        # broadcast over websocket if connections exist
+        payload = to_public({"id": inserted_id, **data, "created_at": datetime.now(timezone.utc)})
+        try:
+            manager.broadcast(room_id, payload)
+        except Exception:
+            pass
+        return {"id": inserted_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/rooms/{room_id}/messages")
+def list_messages(room_id: str, limit: int = Query(50, le=200)):
+    try:
+        docs = get_documents("message", {"room_id": room_id}, limit=limit)
+        docs_sorted = sorted(docs, key=lambda d: d.get("created_at", 0), reverse=True)
+        return [to_public(d) for d in docs_sorted]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, room_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active.setdefault(room_id, []).append(websocket)
+
+    def disconnect(self, room_id: str, websocket: WebSocket):
+        conns = self.active.get(room_id, [])
+        if websocket in conns:
+            conns.remove(websocket)
+        if not conns:
+            self.active.pop(room_id, None)
+
+    async def send_personal(self, websocket: WebSocket, data):
+        await websocket.send_json(data)
+
+    async def broadcast(self, room_id: str, data):
+        conns = self.active.get(room_id, [])
+        for ws in list(conns):
+            try:
+                await ws.send_json(data)
+            except Exception:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                self.disconnect(room_id, ws)
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/ws/rooms/{room_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: str, token: Optional[str] = Query(default=None)):
+    # Simple token validation
+    try:
+        if token:
+            # validate token (best-effort)
+            if db is not None:
+                sess = db["session"].find_one({"token": token})
+                if not sess:
+                    await websocket.close(code=4001)
+                    return
+        await manager.connect(room_id, websocket)
+        while True:
+            data = await websocket.receive_json()
+            # Expect { content: str, sender_id?: str }
+            msg = {
+                "room_id": room_id,
+                "content": data.get("content"),
+                "sender_id": data.get("sender_id"),
+                "created_at": datetime.now(timezone.utc),
+            }
+            # store
+            try:
+                if db is not None:
+                    db["message"].insert_one({**msg, "updated_at": datetime.now(timezone.utc)})
+            except Exception:
+                pass
+            await manager.broadcast(room_id, to_public(msg))
+    except WebSocketDisconnect:
+        manager.disconnect(room_id, websocket)
+    except Exception:
+        # On any error, close connection
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        manager.disconnect(room_id, websocket)
 
 
 @app.get("/test")
